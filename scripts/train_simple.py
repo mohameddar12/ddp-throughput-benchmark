@@ -17,13 +17,14 @@ from transformers import (
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 import logging
-
+from itertools import chain
+from transformers import default_data_collator
 import os, csv
 from pathlib import Path
 from datetime import datetime
 
 class CSVLogger:
-    def __init__(self, out_path: str, fieldnames: list[str]):
+    def __init__(self, out_path, fieldnames):
         self.out_path = Path(out_path)
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
         self.fieldnames = fieldnames
@@ -61,6 +62,8 @@ def load_config(config_path="configs/base_config.yaml"):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
+
+
 # [EXPLAIN] Prepare the dataset end‑to‑end:
 # 1) load HuggingFace dataset split
 # 2) (optionally) cut to a small subset for fast local runs
@@ -68,48 +71,53 @@ def load_config(config_path="configs/base_config.yaml"):
 # 4) return a tokenized Dataset object
 # Note: all heavy work (like tokenization) should be outside the train loop.
 def prepare_dataset(config, tokenizer):
-    """Load and tokenize dataset"""
+    """Load, tokenize, and chunk dataset into fixed-size sequences."""
     logger = logging.getLogger(__name__)
-    
-    # [EXPLAIN] Load dataset by name/subset from config. If it fails, we fall back
-    # to wikitext-2-raw-v1 so the script still runs.
+
+    # Load dataset by name/subset from config
     try:
         dataset = load_dataset(
-            config['dataset']['name'],
+            config['dataset']['name'], 
             config['dataset']['subset'],
             split='train'
         )
     except Exception as e:
         logger.error(f"Error loading dataset: {e}")
-        # Fallback to a simple text dataset
-        logger.info("Using fallback dataset...")
+        logger.info("Using fallback dataset wikitext-2-raw-v1...")
         dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split='train')
-    
-    # [EXPLAIN] Take a smaller subset for quick tests (good for Mac dev).
+
+    # Small subset for quick tests
     if config['dataset']['max_samples']:
         dataset = dataset.select(range(min(len(dataset), config['dataset']['max_samples'])))
-    
-    logger.info(f"Dataset size: {len(dataset)}")
-    
-    # [EXPLAIN] Tokenization function: converts raw text → token IDs with a max length.
-    # We turn padding OFF here because the collator can pad dynamically per batch.
+
+    logger.info(f"Dataset (raw) size: {len(dataset)}")
+
+    # Tokenize without truncation/padding; we’ll size in the chunking step
     def tokenize_function(examples):
-        return tokenizer(
-            examples['text'],
-            truncation=True,
-            padding=False,
-            max_length=config['model']['max_length']
-        )
-    
-    # [EXPLAIN] Map tokenization across the entire dataset (batched for speed)
-    # and drop unused columns so batches contain only model inputs.
-    tokenized_dataset = dataset.map(
+        return tokenizer(examples['text'], truncation=False, padding=False)
+
+    tokenized = dataset.map(
         tokenize_function,
         batched=True,
         remove_columns=dataset.column_names
     )
-    
-    return tokenized_dataset
+
+    # Group tokens into contiguous blocks of exactly block_size
+    block_size = int(config['model']['max_length'])
+
+    def group_texts(examples):
+        concatenated = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = (len(concatenated['input_ids']) // block_size) * block_size
+        if total_length == 0:
+            return {"input_ids": [], "attention_mask": [], "labels": []}
+        input_ids = [concatenated['input_ids'][i:i+block_size] for i in range(0, total_length, block_size)]
+        attention_mask = [[1] * block_size for _ in range(len(input_ids))]
+        labels = [seq.copy() for seq in input_ids]
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+    chunked = tokenized.map(group_texts, batched=True)
+    logger.info(f"Post-chunk dataset size (sequences): {len(chunked)} (each len={block_size})")
+    return chunked
 
 # [EXPLAIN] Main entry point: loads config, sets device, builds model/tokenizer,
 # constructs dataloader, then runs a short training loop while timing throughput.
@@ -150,11 +158,8 @@ def main():
     
     # [EXPLAIN] Collator assembles a batch and pads to the longest sequence in that batch.
     # For causal LM, mlm=False (we’re not doing masked‑LM like BERT).
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False
-    )
-    
+    data_collator = default_data_collator
+
     # [EXPLAIN] DataLoader handles batching + worker processes for prefetching.
     # num_workers>0 uses background workers to load/prepare batches for you.
     dataloader = DataLoader(
@@ -180,7 +185,7 @@ def main():
     
     # [EXPLAIN] For debugging, training is capped to 3 steps **in code**.
     # You’ll remove this and trust the YAML’s training.max_steps soon.
-    max_steps = 3  # Force it for debugging
+    max_steps = int(config["training"]["max_steps"])
     logger.info(f"Starting training for {max_steps} steps...")
     
         # Compose run metadata (handy for later analysis)
@@ -198,7 +203,7 @@ def main():
     # Only rank 0 writes (safe on single GPU too)
     csv_logger = CSVLogger(csv_path, fieldnames=[
         "step","loss","step_time_s","batch_tokens","tokens_per_s","avg_tokens_per_s",
-        "world_size","precision","seq_len","batch_size","grad_accum"
+        "run_id","world_size","precision","seq_len","batch_size","grad_accum"
     ]) if is_rank0() else None
 
     # [EXPLAIN] Enumerate over batches; we stop once we hit max_steps.
@@ -236,26 +241,24 @@ def main():
         # switch to attention_mask.sum() in the “minimal edits” version below to count
         # only real tokens.
         step_time = time.time() - step_start
-        batch_tokens = batch['input_ids'].numel()
+        batch_tokens = int(batch['attention_mask'].sum().item())
         total_tokens += batch_tokens
         tokens_per_second = batch_tokens / step_time
         
+        # Calculate metrics for logging
+        elapsed = time.time() - start_time
+        avg_tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0.0
+
         # [EXPLAIN] Log a summary every 10 steps, plus a running average tokens/sec.
         if step % 10 == 0:
-            elapsed = time.time() - start_time
-            avg_tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
-            
             logger.info(
                 f"Step {step:4d} | Loss: {loss.item():.4f} | "
                 f"Step time: {step_time:.3f}s | "
                 f"Tokens/sec: {tokens_per_second:.1f} | "
                 f"Avg tokens/sec: {avg_tokens_per_sec:.1f}"
             )
-        # tokens/sec for this step
-        tokens_per_second = batch_tokens / step_time if step_time > 0 else 0.0
-        elapsed = time.time() - start_time
-        avg_tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0.0
 
+        # Log to CSV every step
         if csv_logger is not None:
             csv_logger.log({
                 "step": int(step),

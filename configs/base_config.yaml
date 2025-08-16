@@ -2,40 +2,34 @@
 # Base configuration for DDP throughput benchmark
 
 model:
-  name: "gpt2"  # Start with GPT-2 small (124M params)
-  max_length: 512
+  name: "gpt2"            # Which pretrained model to load (GPT‑2 small ~124M)
+  max_length: 256          # Sequence length per sample (attention is O(n^2))
   
 dataset:
-  name: "wikitext"
-  subset: "wikitext-2-raw-v1"
-  max_samples: 1000  # Small for local testing
+  name: "wikitext"        # HuggingFace dataset name
+  subset: "wikitext-2-raw-v1"  # Which subset/split variant to use
+  max_samples: 1000        # Cap training samples for quick local dev
   
 training:
-  batch_size: 4      # Small for Mac testing
-  global_batch_size: 32
-  gradient_accumulation_steps: 8
-  max_steps: 100     # Quick runs for testing
-  learning_rate: 5e-5
-  warmup_steps: 10
-  save_steps: 50
-  eval_steps: 25
-  precision: "fp32"  # Start with fp32, add fp16/bf16 later
-  
+  batch_size: 4            # Per‑device (per‑GPU) batch size
+  global_batch_size: 32    # Target effective batch across GPUs *and* grad accumulation
+  gradient_accumulation_steps: 8  # Steps to accumulate grads before an optimizer step
+  max_steps: 50           # Total training steps (use this instead of a hard‑coded 3)
+  learning_rate: 5e-5      # AdamW LR
+  warmup_steps: 10         # LR warmup steps before linear decay
+  precision: "fp32"       # Switch to "fp16"/"bf16" later for speed on GPU
+
+# [EXPLAIN] On Mac you’ll use gloo/mps; on NVIDIA Linux boxes use nccl.
 distributed:
-  backend: "nccl"    # Will use gloo on Mac
+  backend: "nccl"         # Will use gloo on Mac; nccl on CUDA machines
   find_unused_parameters: false
-  
+
 logging:
   log_level: "INFO"
-  log_dir: "experiments/logs"
+  log_dir: "experiments/logs"    # Where to write metrics / profiler traces
   wandb_project: "ddp-throughput-benchmark"
-  
+
 metrics:
-  measure_gpu_util: true
-  measure_throughput: true
-  profile_steps: [10, 20, 30]  # Profile specific steps
-  
-paths:
-  data_dir: "data"
-  checkpoint_dir: "experiments/checkpoints"
-  results_dir: "experiments/results"
+  measure_gpu_util: true          # Enable later when on real GPU
+  measure_throughput: true        # We’ll compute tokens/sec per step
+  profile_steps: [10, 20, 30]     # Step indices to wrap with torch.profiler (DDP phase)
