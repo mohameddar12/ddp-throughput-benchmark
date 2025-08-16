@@ -1,0 +1,41 @@
+# configs/base_config.yaml
+# Base configuration for DDP throughput benchmark
+
+model:
+  name: "gpt2"  # Start with GPT-2 small (124M params)
+  max_length: 512
+  
+dataset:
+  name: "wikitext"
+  subset: "wikitext-2-raw-v1"
+  max_samples: 1000  # Small for local testing
+  
+training:
+  batch_size: 4      # Small for Mac testing
+  global_batch_size: 32
+  gradient_accumulation_steps: 8
+  max_steps: 100     # Quick runs for testing
+  learning_rate: 5e-5
+  warmup_steps: 10
+  save_steps: 50
+  eval_steps: 25
+  precision: "fp32"  # Start with fp32, add fp16/bf16 later
+  
+distributed:
+  backend: "nccl"    # Will use gloo on Mac
+  find_unused_parameters: false
+  
+logging:
+  log_level: "INFO"
+  log_dir: "experiments/logs"
+  wandb_project: "ddp-throughput-benchmark"
+  
+metrics:
+  measure_gpu_util: true
+  measure_throughput: true
+  profile_steps: [10, 20, 30]  # Profile specific steps
+  
+paths:
+  data_dir: "data"
+  checkpoint_dir: "experiments/checkpoints"
+  results_dir: "experiments/results"

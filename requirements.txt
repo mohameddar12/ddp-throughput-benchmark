@@ -1,0 +1,25 @@
+# Core ML libraries
+torch>=2.1.0
+torchvision
+transformers>=4.30.0
+datasets>=2.14.0
+accelerate>=0.20.0
+
+# Utilities
+numpy
+pandas
+matplotlib
+seaborn
+tqdm
+pyyaml
+wandb
+
+# Development
+jupyter
+black
+flake8
+pytest
+
+# Cloud sync (optional)
+awscli
+google-cloud-storage
