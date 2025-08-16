@@ -1,13 +1,16 @@
 # scripts/train_simple.py
 # Basic training script to test on Mac before moving to distributed
 
+# [EXPLAIN] Imports: core Python timing, PyTorch + YAML for config,
+# Hugging Face Transformers for model/tokenizer, Datasets for data,
+# DataLoader for batching, logging for readable console output.
 import time
 import torch
 import yaml
 from pathlib import Path
 from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM, 
+    AutoTokenizer,
+    AutoModelForCausalLM,
     DataCollatorForLanguageModeling,
     get_linear_schedule_with_warmup
 )
@@ -15,6 +18,29 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 import logging
 
+import os, csv
+from pathlib import Path
+from datetime import datetime
+
+class CSVLogger:
+    def __init__(self, out_path: str, fieldnames: list[str]):
+        self.out_path = Path(out_path)
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.fieldnames = fieldnames
+        self._f = open(self.out_path, "w", newline="")
+        self._w = csv.DictWriter(self._f, fieldnames=fieldnames)
+        self._w.writeheader()
+
+    def log(self, row: dict):
+        self._w.writerow(row)
+        self._f.flush()  # make sure it hits disk each step
+
+    def close(self):
+        try: self._f.close()
+        except Exception: pass
+
+# [EXPLAIN] Configure Python’s logging (INFO level + simple format).
+# Returning a module logger lets us reuse it anywhere in this file.
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
@@ -22,18 +48,34 @@ def setup_logging():
     )
     return logging.getLogger(__name__)
 
+def is_rank0():
+    try:
+        import torch.distributed as dist
+        return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+    except Exception:
+        return True
+
+# [EXPLAIN] Load the YAML file from configs/ (defaults to base_config.yaml).
+# Safe to call at program start to centralize all knobs.
 def load_config(config_path="configs/base_config.yaml"):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
+# [EXPLAIN] Prepare the dataset end‑to‑end:
+# 1) load HuggingFace dataset split
+# 2) (optionally) cut to a small subset for fast local runs
+# 3) tokenize text into input IDs using your model’s tokenizer
+# 4) return a tokenized Dataset object
+# Note: all heavy work (like tokenization) should be outside the train loop.
 def prepare_dataset(config, tokenizer):
     """Load and tokenize dataset"""
     logger = logging.getLogger(__name__)
     
-    # Load dataset with error handling
+    # [EXPLAIN] Load dataset by name/subset from config. If it fails, we fall back
+    # to wikitext-2-raw-v1 so the script still runs.
     try:
         dataset = load_dataset(
-            config['dataset']['name'], 
+            config['dataset']['name'],
             config['dataset']['subset'],
             split='train'
         )
@@ -43,13 +85,14 @@ def prepare_dataset(config, tokenizer):
         logger.info("Using fallback dataset...")
         dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split='train')
     
-    # Take subset for testing
+    # [EXPLAIN] Take a smaller subset for quick tests (good for Mac dev).
     if config['dataset']['max_samples']:
         dataset = dataset.select(range(min(len(dataset), config['dataset']['max_samples'])))
     
     logger.info(f"Dataset size: {len(dataset)}")
     
-    # Tokenize
+    # [EXPLAIN] Tokenization function: converts raw text → token IDs with a max length.
+    # We turn padding OFF here because the collator can pad dynamically per batch.
     def tokenize_function(examples):
         return tokenizer(
             examples['text'],
@@ -58,6 +101,8 @@ def prepare_dataset(config, tokenizer):
             max_length=config['model']['max_length']
         )
     
+    # [EXPLAIN] Map tokenization across the entire dataset (batched for speed)
+    # and drop unused columns so batches contain only model inputs.
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
@@ -66,41 +111,52 @@ def prepare_dataset(config, tokenizer):
     
     return tokenized_dataset
 
+# [EXPLAIN] Main entry point: loads config, sets device, builds model/tokenizer,
+# constructs dataloader, then runs a short training loop while timing throughput.
 def main():
     logger = setup_logging()
     config = load_config()
     
-    # Debug: Print the actual config being used
+    # [EXPLAIN] Print a few key config values for sanity checking.
     logger.info(f"Config loaded: max_steps = {config['training']['max_steps']}")
     logger.info(f"Batch size = {config['training']['batch_size']}")
     logger.info(f"Max length = {config['model']['max_length']}")
     
-    # Device setup (force CPU for debugging)
-    # Temporarily disable MPS to test
+    # [EXPLAIN] Device setup. Currently **forced to CPU** for debugging.
+    # On a Mac with Apple Silicon, you’ll want to use MPS later:
+    #   device = torch.device('mps') if torch.backends.mps.is_available() else torch.device('cpu')
+    # For NVIDIA GPUs on Linux, you’d use CUDA:
+    #   device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    # For now, it’s CPU so everything is slow but reliable.
     device = torch.device("cpu")
     logger.info("Using CPU for debugging")
     
-    # Load model and tokenizer
+    # [EXPLAIN] Load a small pretrained Causal LM (GPT‑2) + its tokenizer.
+    # This gives you a working model without custom architecture code.
     logger.info(f"Loading model: {config['model']['name']}")
     tokenizer = AutoTokenizer.from_pretrained(config['model']['name'])
     model = AutoModelForCausalLM.from_pretrained(config['model']['name'])
     
-    # Add pad token if it doesn't exist
+    # [EXPLAIN] Some GPT‑2 checkpoints don’t define a pad token.
+    # We set it to EOS so padding behaves sanely for batching.
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # [EXPLAIN] Move the model weights to the selected device (CPU for now).
     model.to(device)
     
-    # Prepare dataset
+    # [EXPLAIN] Build the tokenized dataset according to config.
     dataset = prepare_dataset(config, tokenizer)
     
-    # Data collator
+    # [EXPLAIN] Collator assembles a batch and pads to the longest sequence in that batch.
+    # For causal LM, mlm=False (we’re not doing masked‑LM like BERT).
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
-        mlm=False  # Causal LM, not masked LM
+        mlm=False
     )
     
-    # DataLoader
+    # [EXPLAIN] DataLoader handles batching + worker processes for prefetching.
+    # num_workers>0 uses background workers to load/prepare batches for you.
     dataloader = DataLoader(
         dataset,
         batch_size=config['training']['batch_size'],
@@ -109,7 +165,7 @@ def main():
         num_workers=2  # Adjust based on your Mac
     )
     
-    # Optimizer and scheduler
+    # [EXPLAIN] AdamW is the common optimizer. Scheduler warms up LR then decays linearly.
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(config['training']['learning_rate']))
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -117,49 +173,74 @@ def main():
         num_training_steps=config['training']['max_steps']
     )
     
-    # Training loop with metrics
+    # [EXPLAIN] Training loop state: running averages + timers for throughput.
     model.train()
     total_tokens = 0
     start_time = time.time()
-    max_steps = 3  # Force it for debugging
     
+    # [EXPLAIN] For debugging, training is capped to 3 steps **in code**.
+    # You’ll remove this and trust the YAML’s training.max_steps soon.
+    max_steps = 3  # Force it for debugging
     logger.info(f"Starting training for {max_steps} steps...")
     
+        # Compose run metadata (handy for later analysis)
+    run_meta = {
+        "run_id": datetime.utcnow().strftime("%Y%m%d-%H%M%S"),
+        "world_size": int(os.environ.get("WORLD_SIZE", 1)),
+        "precision": str(config["training"]["precision"]).lower(),
+        "seq_len": int(config["model"]["max_length"]),
+        "batch_size": int(config["training"]["batch_size"]),
+        "grad_accum": int(config["training"]["gradient_accumulation_steps"]),
+    }
+
+    csv_path = Path(config["logging"]["log_dir"]) / f"metrics_{run_meta['run_id']}.csv"
+
+    # Only rank 0 writes (safe on single GPU too)
+    csv_logger = CSVLogger(csv_path, fieldnames=[
+        "step","loss","step_time_s","batch_tokens","tokens_per_s","avg_tokens_per_s",
+        "world_size","precision","seq_len","batch_size","grad_accum"
+    ]) if is_rank0() else None
+
+    # [EXPLAIN] Enumerate over batches; we stop once we hit max_steps.
     for step, batch in enumerate(dataloader):
         if int(step) >= int(max_steps):
             logger.info(f"Reached max_steps ({max_steps}), stopping training")
             break
-            
+        
         logger.info(f"Starting step {step}")
         step_start = time.time()
         
-        # Move batch to device
+        # [EXPLAIN] Move the whole batch to the target device.
+        # (In DDP, each rank would do this to its own per‑GPU batch.)
         logger.info(f"Moving batch to device...")
         batch = {k: v.to(device) for k, v in batch.items()}
         logger.info(f"Batch moved to device")
         
-        # Check for empty batch
+        # [EXPLAIN] Basic guard: if somehow the collator produced an empty batch, skip.
         if batch['input_ids'].numel() == 0:
             logger.warning(f"Empty batch at step {step}, skipping...")
             continue
         
-        # Forward pass
+        # [EXPLAIN] Forward pass: run model → get loss comparing predictions vs labels.
         outputs = model(**batch)
         loss = outputs.loss
         
-        # Backward pass
+        # [EXPLAIN] Backward pass + optimizer step + LR schedule update.
         loss.backward()
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
         
-        # Calculate metrics
+        # [EXPLAIN] Metrics: time for this step, how many tokens processed, instantaneous
+        # tokens/sec. Note: using input_ids.numel() counts **padded tokens** too; we’ll
+        # switch to attention_mask.sum() in the “minimal edits” version below to count
+        # only real tokens.
         step_time = time.time() - step_start
         batch_tokens = batch['input_ids'].numel()
         total_tokens += batch_tokens
         tokens_per_second = batch_tokens / step_time
         
-        # Log every 10 steps
+        # [EXPLAIN] Log a summary every 10 steps, plus a running average tokens/sec.
         if step % 10 == 0:
             elapsed = time.time() - start_time
             avg_tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
@@ -170,7 +251,23 @@ def main():
                 f"Tokens/sec: {tokens_per_second:.1f} | "
                 f"Avg tokens/sec: {avg_tokens_per_sec:.1f}"
             )
+        # tokens/sec for this step
+        tokens_per_second = batch_tokens / step_time if step_time > 0 else 0.0
+        elapsed = time.time() - start_time
+        avg_tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0.0
+
+        if csv_logger is not None:
+            csv_logger.log({
+                "step": int(step),
+                "loss": float(loss.item()),
+                "step_time_s": round(step_time, 6),
+                "batch_tokens": int(batch_tokens),
+                "tokens_per_s": round(tokens_per_second, 2),
+                "avg_tokens_per_s": round(avg_tokens_per_sec, 2),
+                **run_meta,
+            })
     
+    # [EXPLAIN] Final aggregate stats for the whole run.
     total_time = time.time() - start_time
     avg_throughput = total_tokens / total_time
     
