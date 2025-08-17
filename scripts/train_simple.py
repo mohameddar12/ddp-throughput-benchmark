@@ -1,9 +1,6 @@
 # scripts/train_simple.py
-# Basic training script to test on Mac before moving to distributed
+# Basic training script to test on Mac/PC before moving to distributed
 
-# [EXPLAIN] Imports: core Python timing, PyTorch + YAML for config,
-# Hugging Face Transformers for model/tokenizer, Datasets for data,
-# DataLoader for batching, logging for readable console output.
 import time
 import torch
 import yaml
@@ -40,8 +37,7 @@ class CSVLogger:
         try: self._f.close()
         except Exception: pass
 
-# [EXPLAIN] Configure Python’s logging (INFO level + simple format).
-# Returning a module logger lets us reuse it anywhere in this file.
+
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
@@ -167,9 +163,13 @@ def main():
         batch_size=config['training']['batch_size'],
         shuffle=True,
         collate_fn=data_collator,
-        num_workers=2  # Adjust based on your Mac
+        num_workers=4  # Adjust based on your Mac
     )
     
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+
     # [EXPLAIN] AdamW is the common optimizer. Scheduler warms up LR then decays linearly.
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(config['training']['learning_rate']))
     scheduler = get_linear_schedule_with_warmup(
@@ -227,12 +227,31 @@ def main():
             continue
         
         # [EXPLAIN] Forward pass: run model → get loss comparing predictions vs labels.
-        outputs = model(**batch)
-        loss = outputs.loss
+
+        use_cuda = torch.cuda.is_available()
+        device = torch.device("cuda" if use_cuda else "cpu")
+
+        use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
+        use_fp16 = use_cuda and not use_bf16  # default to fp16 if bf16 not available
+
+
+        amp_ctx = (
+            torch.amp.autocast('cuda', dtype=torch.bfloat16) if use_bf16 else
+            torch.amp.autocast('cuda', enabled=use_fp16)     # fp16 autocast
+        )
+
+        scaler = torch.amp.GradScaler('cuda', enabled=use_fp16)  # not needed for bf16
         
         # [EXPLAIN] Backward pass + optimizer step + LR schedule update.
-        loss.backward()
-        optimizer.step()
+        with amp_ctx:
+            out = model(**batch)
+            loss = out.loss
+        if use_fp16:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer); scaler.update()
+        else:  # bf16 or fp32
+            loss.backward()
+            optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
         

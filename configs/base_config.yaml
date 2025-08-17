@@ -3,7 +3,7 @@
 
 model:
   name: "gpt2"            # Which pretrained model to load (GPT‑2 small ~124M)
-  max_length: 256          # Sequence length per sample (attention is O(n^2))
+  max_length: 512          # Sequence length per sample (attention is O(n^2))
   
 dataset:
   name: "wikitext"        # HuggingFace dataset name
@@ -17,7 +17,7 @@ training:
   max_steps: 50           # Total training steps (use this instead of a hard‑coded 3)
   learning_rate: 5e-5      # AdamW LR
   warmup_steps: 10         # LR warmup steps before linear decay
-  precision: "fp32"       # Switch to "fp16"/"bf16" later for speed on GPU
+  precision: "fp16"       # Switch to "fp16"/"bf16" later for speed on GPU
 
 # [EXPLAIN] On Mac you’ll use gloo/mps; on NVIDIA Linux boxes use nccl.
 distributed:
