@@ -1,35 +1,43 @@
-# configs/base_config.yaml
-# Base configuration for DDP throughput benchmark
+# configs/base_config.yaml — AWS p3.8xlarge tuned
 
 model:
-  name: "gpt2"            # Which pretrained model to load (GPT‑2 small ~124M)
-  max_length: 512          # Sequence length per sample (attention is O(n^2))
-  
-dataset:
-  name: "wikitext"        # HuggingFace dataset name
-  subset: "wikitext-2-raw-v1"  # Which subset/split variant to use
-  max_samples: 1000        # Cap training samples for quick local dev
-  
-training:
-  batch_size: 4            # Per‑device (per‑GPU) batch size
-  global_batch_size: 32    # Target effective batch across GPUs *and* grad accumulation
-  gradient_accumulation_steps: 8  # Steps to accumulate grads before an optimizer step
-  max_steps: 50           # Total training steps (use this instead of a hard‑coded 3)
-  learning_rate: 5e-5      # AdamW LR
-  warmup_steps: 10         # LR warmup steps before linear decay
-  precision: "fp16"       # Switch to "fp16"/"bf16" later for speed on GPU
+  name: "gpt2"              # 124M
+  max_length: 512            # tokenized sequence length
 
-# [EXPLAIN] On Mac you’ll use gloo/mps; on NVIDIA Linux boxes use nccl.
+dataset:
+  name: "wikitext"
+  subset: "wikitext-2-raw-v1"
+  max_samples: 1000          # keep small for throughput bench
+  num_workers: 8             # per process; tune 4–8
+  prefetch_factor: 2
+
+training:
+  batch_size: 4              # per-GPU micro-batch
+  global_batch_size: 32      # across all GPUs *after* grad accum
+  gradient_accumulation_steps: 8
+  max_steps: 100             # short runs for clean timing
+  learning_rate: 5e-5
+  warmup_steps: 10
+  save_steps: 0              # disable to avoid I/O noise during bench
+  eval_steps: 0              # disable mid-run eval for timing purity
+  precision: "fp16"         # V100 supports FP16 (bf16 not native)
+  deterministic: false
+
 distributed:
-  backend: "nccl"         # Will use gloo on Mac; nccl on CUDA machines
+  backend: "nccl"
   find_unused_parameters: false
 
 logging:
   log_level: "INFO"
-  log_dir: "experiments/logs"    # Where to write metrics / profiler traces
+  log_dir: "experiments/logs"
   wandb_project: "ddp-throughput-benchmark"
 
 metrics:
-  measure_gpu_util: true          # Enable later when on real GPU
-  measure_throughput: true        # We’ll compute tokens/sec per step
-  profile_steps: [10, 20, 30]     # Step indices to wrap with torch.profiler (DDP phase)
+  measure_gpu_util: true
+  measure_throughput: true
+  profile_steps: [10, 20, 30]  # short profile windows
+
+paths:
+  datasets_cache: "~/datasets"
+  hf_cache: "~/cache/hf"
+  torch_cache: "~/cache/torch"
